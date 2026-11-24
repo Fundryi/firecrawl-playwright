@@ -18,6 +18,19 @@ All changes are in `api.ts` (`scrapePage`) and `helpers/challenge.ts`; tests in
 | Clicks Amazon's "Continue shopping" checkpoint, then opens the requested URL again | The checkpoint sometimes replaces the product page; the click itself lands on the home page |
 | Waits up to `SETTLE_MS` (default 1500) for a follow-up navigation when the page is not a plain 200 or is smaller than `SETTLE_SMALL_PAGE_BYTES` (default 10000) | Cookie stubs that reload themselves (for example PMC's 203 "Cookies must be enabled") |
 | Logs every main-frame document response (`↪ status method url`) | Makes challenge and redirect chains visible in the container log |
+| Optional last-resort fallback to paid unblocker APIs (`helpers/fallback.ts`): only when the browser result is still a bot wall (challenge title, DataDome/PerimeterX/Amazon markers, or a small 401/403/429/503 page), and only through providers whose credentials are set, in order. Off unless configured | Some walls (DataDome) beat every free browser; a small free tier covers occasional pages |
+
+## Fallback settings (all optional, environment only)
+
+| Variable | Meaning |
+|---|---|
+| `SCRAPEDO_TOKEN` | enables Scrape.do |
+| `BRIGHTDATA_API_KEY` + `BRIGHTDATA_ZONE` | enables Bright Data Web Unlocker |
+| `FALLBACK_PROVIDERS` | order, default `scrapedo,brightdata` |
+| `FALLBACK_TIMEOUT_MS` | per provider, default 90000 |
+| `FALLBACK_SKIP_HOSTS` | comma list of hosts never sent to a paid provider |
+
+Internal targets are refused before any provider is called (the upstream SSRF check runs first).
 
 ## Upkeep
 

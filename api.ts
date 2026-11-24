@@ -20,6 +20,7 @@ import {
 } from './helpers/egress';
 import { HostPacer } from './helpers/pacer';
 import { isNavigatingError, waitOutChallenge } from './helpers/challenge';
+import { hostSkipped, looksBlocked, providersFromEnv, tryFallback } from './helpers/fallback';
 
 dotenv.config();
 
@@ -57,6 +58,9 @@ const CHALLENGE_MAX_WAIT_MS = envInt('CHALLENGE_MAX_WAIT_MS', 20000);
 // (cookie stubs); wait up to SETTLE_MS for that follow-up navigation. 0 = off.
 const SETTLE_MS = envInt('SETTLE_MS', 1500);
 const SETTLE_SMALL_PAGE_BYTES = envInt('SETTLE_SMALL_PAGE_BYTES', 10000);
+// Optional paid unblockers, only for pages the browser could not get (helpers/fallback.ts).
+const FALLBACK_PROVIDERS = providersFromEnv(process.env);
+const FALLBACK_TIMEOUT_MS = envInt('FALLBACK_TIMEOUT_MS', 90000);
 // Unset by default: Chrome then derives navigator.languages and
 // Accept-Language from LANG ("en-US,en;q=0.9"), like a real install. An
 // explicit locale makes Playwright send the bare tag ("en-US"), which no
@@ -669,6 +673,23 @@ app.post('/scrape', async (req: Request, res: Response) => {
       check_selector,
       securityState,
     );
+
+    // Last resort: the browser got a bot wall. Hand the URL to the configured paid
+    // unblockers in order (assertSafeTargetUrl above already refused internal targets).
+    if (
+      FALLBACK_PROVIDERS.length > 0 &&
+      looksBlocked({ content: result.content, status: result.status }) &&
+      !hostSkipped(url, process.env)
+    ) {
+      console.log(`🛟 Browser blocked (status ${result.status}), trying fallback providers`);
+      const fb = await tryFallback(url, FALLBACK_PROVIDERS, FALLBACK_TIMEOUT_MS);
+      if (fb) {
+        result.content = fb.content;
+        result.status = fb.status;
+        result.contentType = 'text/html';
+      }
+    }
+
     const pageError =
       result.status !== 200 ? getError(result.status) : undefined;
 
@@ -711,6 +732,11 @@ app.post('/scrape', async (req: Request, res: Response) => {
 });
 
 const start = async () => {
+  console.log(
+    FALLBACK_PROVIDERS.length > 0
+      ? `🛟 Fallback providers for blocked pages: ${FALLBACK_PROVIDERS.map((p) => p.name).join(' > ')}`
+      : '🛟 No fallback providers configured',
+  );
   if (egressPool.size === 0) {
     directProxyPort = await startSSRFProxy();
     console.warn(
