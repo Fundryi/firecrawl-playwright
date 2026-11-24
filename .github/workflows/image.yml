@@ -4,6 +4,9 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  # Weekly rebuild: picks up the current Google Chrome stable and OS packages.
+  schedule:
+    - cron: '17 3 * * 1'
 
 permissions:
   contents: read
@@ -13,7 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  IMAGE: ghcr.io/carneirofc/firecrawl-playwright
+  IMAGE: ghcr.io/fundryi/firecrawl-playwright
 
 jobs:
   test:

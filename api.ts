@@ -5,6 +5,7 @@ import {
   BrowserContext,
   Route,
   Request as PlaywrightRequest,
+  Response as PlaywrightResponse,
   Page,
 } from 'patchright';
 import dotenv from 'dotenv';
@@ -18,6 +19,7 @@ import {
   startHealthChecks,
 } from './helpers/egress';
 import { HostPacer } from './helpers/pacer';
+import { isNavigatingError, waitOutChallenge } from './helpers/challenge';
 
 dotenv.config();
 
@@ -49,6 +51,12 @@ const HEADLESS = (process.env.HEADLESS || 'False').toUpperCase() === 'TRUE';
 const BROWSER_CHANNEL = process.env.BROWSER_CHANNEL || 'chrome';
 const WINDOW_WIDTH = envInt('WINDOW_WIDTH', 1920);
 const WINDOW_HEIGHT = envInt('WINDOW_HEIGHT', 1080);
+// Longest wait for an anti-bot interstitial to clear before giving up (ms).
+const CHALLENGE_MAX_WAIT_MS = envInt('CHALLENGE_MAX_WAIT_MS', 20000);
+// Pages that are not a plain 200, or smaller than this, may reload themselves
+// (cookie stubs); wait up to SETTLE_MS for that follow-up navigation. 0 = off.
+const SETTLE_MS = envInt('SETTLE_MS', 1500);
+const SETTLE_SMALL_PAGE_BYTES = envInt('SETTLE_SMALL_PAGE_BYTES', 10000);
 // Unset by default: Chrome then derives navigator.languages and
 // Accept-Language from LANG ("en-US,en;q=0.9"), like a real install. An
 // explicit locale makes Playwright send the bare tag ("en-US"), which no
@@ -322,6 +330,20 @@ const isValidUrl = (urlString: string): boolean => {
   }
 };
 
+// content() fails while the page is still navigating (a challenge redirect);
+// wait for the new document and try again.
+const readContent = async (page: Page): Promise<string> => {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await page.content();
+    } catch (error) {
+      if (!isNavigatingError(error) || attempt >= 5) throw error;
+      await page.waitForLoadState('load', { timeout: 10000 }).catch(() => undefined);
+      await page.waitForTimeout(500);
+    }
+  }
+};
+
 const scrapePage = async (
   page: Page,
   url: string,
@@ -336,6 +358,18 @@ const scrapePage = async (
     `Navigating to ${url} with waitUntil: ${waitUntil} and timeout: ${timeout}ms` +
       (waited > 0 ? ` (paced ${waited}ms)` : ''),
   );
+  // Main-frame document responses, so the status we report belongs to the page
+  // we return: a cleared Cloudflare challenge reloads the page (first 403, then 200).
+  // An object, not a let: TypeScript does not track assignments made in callbacks.
+  const nav: { last: PlaywrightResponse | null } = { last: null };
+  const onResponse = (r: PlaywrightResponse) => {
+    if (r.request().isNavigationRequest() && r.frame() === page.mainFrame()) {
+      nav.last = r;
+      console.log(`↪ ${r.status()} ${r.request().method()} ${r.url()}`);
+    }
+  };
+  page.on('response', onResponse);
+
   let response;
   try {
     response = await page.goto(url, { waitUntil, timeout });
@@ -353,6 +387,64 @@ const scrapePage = async (
     await page.waitForTimeout(waitAfterLoad);
   }
 
+  // Anti-bot interstitials ("Just a moment...") clear on their own in a real
+  // browser; wait for that instead of returning the challenge page.
+  const challenge = await waitOutChallenge(
+    {
+      title: () => page.title().catch(() => null),
+      waitForLoad: (ms) => page.waitForLoadState('load', { timeout: ms }),
+      sleep: (ms) => page.waitForTimeout(ms),
+      now: () => Date.now(),
+    },
+    Math.min(CHALLENGE_MAX_WAIT_MS, timeout),
+  );
+  if (challenge.seen) {
+    console.log(
+      challenge.cleared
+        ? '🛡️ Challenge page cleared'
+        : `🛡️ Challenge page still showing after ${CHALLENGE_MAX_WAIT_MS}ms`,
+    );
+  }
+
+  // Amazon sometimes answers with a "Click the button below to continue
+  // shopping" checkpoint instead of the product; a real visitor clicks through.
+  // The click lands on the home page, so open the requested URL again (the
+  // checkpoint cookie is set by then).
+  for (let i = 0; i < 2; i++) {
+    const button = await page
+      .$('form[action*="validateCaptcha"] button[type="submit"]')
+      .catch(() => null);
+    if (!button) break;
+    console.log('🛒 Amazon checkpoint, clicking "Continue shopping"');
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: 'load', timeout: 15000 }).catch(() => undefined),
+      button.click().catch(() => undefined),
+    ]);
+    if (new URL(page.url()).pathname !== new URL(url).pathname) {
+      await page.goto(url, { waitUntil, timeout }).catch(() => undefined);
+    }
+  }
+
+  // Some sites answer with a small stub that sets a cookie and reloads itself
+  // (PMC: 203 "Cookies must be enabled", then the article). When the page is
+  // not a plain 200 or is tiny, give it a moment to navigate on its own.
+  const firstStatus = nav.last?.status() ?? response?.status() ?? null;
+  const looksLikeStub =
+    firstStatus !== 200 ||
+    (await page.content().catch(() => '')).length < SETTLE_SMALL_PAGE_BYTES;
+  if (looksLikeStub && SETTLE_MS > 0) {
+    const navigated = await page
+      .waitForEvent('framenavigated', {
+        predicate: (f) => f === page.mainFrame(),
+        timeout: SETTLE_MS,
+      })
+      .then(() => true)
+      .catch(() => false);
+    if (navigated) {
+      await page.waitForLoadState('load', { timeout: 15000 }).catch(() => undefined);
+    }
+  }
+
   if (checkSelector) {
     try {
       await page.waitForSelector(checkSelector, { timeout });
@@ -362,8 +454,12 @@ const scrapePage = async (
   }
 
   let headers = null,
-    content = await page.content(),
+    content = await readContent(page),
     landedUrl = page.url();
+  // Report the response of the document we return, not the first one
+  // (a cleared challenge: first 403, final 200).
+  page.off('response', onResponse);
+  if (nav.last) response = nav.last;
   let ct: string | undefined = undefined;
   if (response) {
     headers = await response.allHeaders();

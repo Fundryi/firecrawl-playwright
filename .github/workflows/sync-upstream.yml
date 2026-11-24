@@ -1,0 +1,44 @@
+name: sync-upstream
+
+# Keeps this fork in step with carneirofc/firecrawl-playwright: merges its main
+# every day and, when anything new arrived, starts the image build (a push made
+# with GITHUB_TOKEN does not trigger other workflows by itself). A merge conflict,
+# or an upstream change to .github/workflows (GITHUB_TOKEN may not push those),
+# fails this job; GitHub reports that by email, and the merge is done by hand.
+
+on:
+  schedule:
+    - cron: '41 2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Merge upstream main
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/carneirofc/firecrawl-playwright.git
+          git fetch upstream main
+          before=$(git rev-parse HEAD)
+          git merge --no-edit upstream/main
+          if [ "$(git rev-parse HEAD)" = "$before" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git push origin HEAD:main
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+      - name: Build the image
+        if: steps.merge.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run image.yml --ref main
